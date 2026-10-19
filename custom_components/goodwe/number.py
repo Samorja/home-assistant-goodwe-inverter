@@ -33,6 +33,16 @@ class GoodweNumberEntityDescription(NumberEntityDescription):
     filter: Callable[[Inverter], bool]
 
 
+def _rated_power_w(inverter: Inverter) -> int:
+    """Return inverter rated power in W.
+
+    Some inverters (e.g. GoodWe ESA) report rated power in units of 100 W
+    (125 for a 12.5 kW unit); no hybrid inverter is rated below 1 kW.
+    """
+    rated_power = inverter.rated_power or 0
+    return rated_power * 100 if 0 < rated_power < 1000 else rated_power
+
+
 def _get_setting_unit(inverter: Inverter, setting: str) -> str:
     """Return the unit of an inverter setting."""
     return next((s.unit for s in inverter.settings() if s.id_ == setting), "")
@@ -224,9 +234,8 @@ async def async_setup_entry(
             description.key in ("grid_export_limit", "ems_power_limit")
             and description.native_unit_of_measurement == UnitOfPower.WATT
         ):
-            entity.native_max_value = (
-                inverter.rated_power * 2 if inverter.rated_power else 10000
-            )
+            rated_power = _rated_power_w(inverter)
+            entity.native_max_value = rated_power * 2 if rated_power else 10000
         entities.append(entity)
 
     async_add_entities(entities)
