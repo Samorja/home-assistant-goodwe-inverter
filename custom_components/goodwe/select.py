@@ -1,6 +1,7 @@
 """GoodWe PV inverter selection settings entities."""
 
 from dataclasses import dataclass
+from datetime import timedelta
 import logging
 
 from goodwe import Inverter, InverterError, OperationMode
@@ -13,8 +14,10 @@ from homeassistant.const import (
     Platform,
 )
 from homeassistant.core import Event, HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.entity_component import async_update_entity
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.event import async_track_state_change_event
 
@@ -22,6 +25,9 @@ from .const import DOMAIN
 from .coordinator import GoodweConfigEntry
 
 _LOGGER = logging.getLogger(__name__)
+
+# Polling interval of entities that read their value from the inverter (EMS mode)
+SCAN_INTERVAL = timedelta(minutes=1)
 
 
 _MODE_TO_OPTION: dict[OperationMode, str] = {
@@ -64,6 +70,28 @@ EMS_MODE = GoodweSelectEntityDescription(
     options={e.name.lower(): e.value for e in list(EMSMode)}
     | {"stop": EMS_MODE_STOP},
 )
+
+
+async def _async_refresh_ems_entities(hass: HomeAssistant, inverter: Inverter) -> None:
+    """Re-read EMS mode and EMS power limit from the inverter.
+
+    Changing the operation mode rewrites the EMS registers (47511/47512),
+    so the values shown in HA would otherwise be stale.
+    """
+    registry = er.async_get(hass)
+    for platform, key in (
+        (Platform.SELECT, "ems_mode"),
+        (Platform.NUMBER, "ems_power_limit"),
+    ):
+        entity_id = registry.async_get_entity_id(
+            platform, DOMAIN, f"{DOMAIN}-{key}-{inverter.serial_number}"
+        )
+        if not entity_id:
+            continue
+        try:
+            await async_update_entity(hass, entity_id)
+        except (HomeAssistantError, InverterError) as err:
+            _LOGGER.debug("Could not refresh %s: %s", entity_id, err)
 
 
 def _ems_mode_option(value: int | None) -> str | None:
@@ -201,6 +229,7 @@ class InverterOperationModeEntity(SelectEntity):
             return
         self._attr_current_option = option
         self.async_write_ha_state()
+        await _async_refresh_ems_entities(self.hass, self._inverter)
 
     async def async_update(self) -> None:
         """Get the current value from inverter."""
@@ -231,6 +260,8 @@ class InverterOperationModeEntity(SelectEntity):
                         self._eco_mode_power,
                         err,
                     )
+                else:
+                    await _async_refresh_ems_entities(self.hass, self._inverter)
 
     async def update_eco_mode_soc(self, event: Event) -> None:
         """Update eco mode SoC value in inverter (when in eco mode)."""
@@ -256,12 +287,16 @@ class InverterOperationModeEntity(SelectEntity):
                         self._eco_mode_soc,
                         err,
                     )
+                else:
+                    await _async_refresh_ems_entities(self.hass, self._inverter)
 
 
 class InverterEMSModeEntity(SelectEntity):
     """Entity representing the inverter EMS mode."""
 
-    _attr_should_poll = False
+    # EMS mode can be changed by the inverter itself (e.g. operation mode change),
+    # poll it so the state shown matches register 47511
+    _attr_should_poll = True
     _attr_has_entity_name = True
     entity_description: GoodweSelectEntityDescription
 
@@ -295,5 +330,9 @@ class InverterEMSModeEntity(SelectEntity):
 
     async def async_update(self) -> None:
         """Get the current EMS mode from inverter."""
-        value = await self._inverter.read_setting("ems_mode")
+        try:
+            value = await self._inverter.read_setting("ems_mode")
+        except InverterError as err:
+            _LOGGER.debug("Could not read EMS mode: %s", err)
+            return
         self._attr_current_option = _ems_mode_option(value)
